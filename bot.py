@@ -32,8 +32,8 @@ MAX_AGE_HOURS    = 4
 MIN_AI_SCORE     = 4
 
 # --- Scanner ---
-SCAN_INTERVAL_SEC = 120   # toutes les 2 minutes
-SCAN_LIMIT        = 200    # 50 tokens récents par scan
+SCAN_INTERVAL_SEC = 120
+SCAN_LIMIT        = 100
 
 # Anti-doublon
 already_alerted      = set()
@@ -63,7 +63,7 @@ def send_telegram(message: str):
 #  🔍  FILTRES
 # ============================================================
 
-def passes_filters(token: dict) -> tuple[bool, str]:
+def passes_filters(token: dict) -> tuple:
     mcap        = token.get("usd_market_cap", 0)
     age_minutes = token.get("age_minutes", 9999)
     dev_pct     = token.get("dev_hold_pct", 100.0)
@@ -86,7 +86,7 @@ def passes_filters(token: dict) -> tuple[bool, str]:
 
 def enrich_token(mint: str, base: dict = {}) -> dict:
     try:
-        r    = requests.get(f"https://frontend-api.pump.fun/coins/{mint}", timeout=8)
+        r    = requests.get(f"https://frontend-api-v3.pump.fun/coins/{mint}", timeout=8)
         data = r.json() if r.status_code == 200 else {}
 
         created_ts   = data.get("created_timestamp", 0)
@@ -116,7 +116,7 @@ def enrich_token(mint: str, base: dict = {}) -> dict:
 
 def _get_insider_pct(mint: str, total_supply: int) -> float:
     try:
-        r       = requests.get(f"https://frontend-api.pump.fun/coins/{mint}/top-holders", timeout=6)
+        r       = requests.get(f"https://frontend-api-v3.pump.fun/coins/{mint}/top-holders", timeout=6)
         holders = r.json() if r.status_code == 200 else []
         total   = sum(h.get("balance", 0) for h in holders[:10])
         return round((total / total_supply) * 100, 2) if total_supply else 0.0
@@ -135,7 +135,7 @@ NITTER_INSTANCES = [
 ]
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"}
 
-def get_twitter_data(username: str) -> dict | None:
+def get_twitter_data(username: str):
     if not username:
         return None
     username = username.strip().lstrip("@")
@@ -200,7 +200,7 @@ def get_twitter_data(username: str) -> dict | None:
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-def analyze_with_ai(token: dict, twitter_data: dict | None) -> dict:
+def analyze_with_ai(token: dict, twitter_data) -> dict:
     mcap = token.get("usd_market_cap", 0)
 
     tw_section = "\nTWITTER : Aucun compte trouvé."
@@ -249,13 +249,14 @@ JSON :
 }}"""
 
     try:
-        resp = groq_client.chat.completions.create(
+        resp  = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=700, temperature=0.4,
         )
         raw   = resp.choices[0].message.content.strip()
-        start = raw.find("{"); end = raw.rfind("}") + 1
+        start = raw.find("{")
+        end   = raw.rfind("}") + 1
         return json.loads(raw[start:end]) if start != -1 and end > start else _default_analysis()
     except Exception as e:
         print(f"[AI ERROR] {e}")
@@ -278,11 +279,15 @@ def _default_analysis():
 #  📋  FORMATAGE
 # ============================================================
 
-def fmt(n): return f"{n/1_000_000:.1f}M" if n >= 1_000_000 else f"{n/1_000:.0f}K" if n >= 1_000 else str(n)
+def fmt(n):
+    if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:     return f"{n/1_000:.0f}K"
+    return str(n)
+
 def semoji(s): return "🟢" if s >= 8 else "🟡" if s >= 6 else "🔴"
 def pemoji(p): return "🔥" if p >= 70 else "⚡" if p >= 40 else "❄️"
 
-def format_alert(token: dict, twitter_data: dict | None, analysis: dict) -> str:
+def format_alert(token: dict, twitter_data, analysis: dict) -> str:
     score = analysis["score_confiance"]["valeur"]
     pred  = analysis.get("prediction_ath", {})
     cats  = "\n".join(f"  ✨ {c}" for c in pred.get("catalyseurs", []))
@@ -341,27 +346,35 @@ def scan_loop():
 
     while True:
         try:
-            r      = requests.get(
-                "https://frontend-api.pump.fun/coins",
-                params={"offset": 0, "limit": SCAN_LIMIT, "sort": "created_timestamp", "order": "DESC"},
+            # API v3 Pump.fun — endpoint corrigé
+            r = requests.get(
+                "https://frontend-api-v3.pump.fun/coins",
+                params={
+                    "offset":      0,
+                    "limit":       SCAN_LIMIT,
+                    "sort":        "last_trade_timestamp",
+                    "order":       "DESC",
+                    "includeNsfw": False,
+                },
                 timeout=10
             )
-            tokens = r.json() if r.status_code == 200 and isinstance(r.json(), list) else []
+
+            data = r.json() if r.status_code == 200 else []
+            tokens = data if isinstance(data, list) else data.get("coins", [])
             print(f"[SCANNER] {len(tokens)} tokens — analyse...")
 
-            for data in tokens:
-                mint = data.get("mint", "")
+            for token_data in tokens:
+                mint = token_data.get("mint", "")
                 if not mint:
                     continue
 
-                # Anti-doublon
                 with already_alerted_lock:
                     if mint in already_alerted:
                         continue
 
                 # Pré-filtre rapide
-                mcap       = data.get("usd_market_cap", 0)
-                created_ts = data.get("created_timestamp", 0)
+                mcap       = token_data.get("usd_market_cap", 0)
+                created_ts = token_data.get("created_timestamp", 0)
                 age_min    = int((time.time() - created_ts / 1000) / 60) if created_ts else 9999
 
                 if not (MCAP_MIN <= mcap <= MCAP_MAX):
@@ -370,7 +383,7 @@ def scan_loop():
                     continue
 
                 # Enrichissement complet
-                token = enrich_token(mint, {"name": data.get("name"), "symbol": data.get("symbol")})
+                token  = enrich_token(mint, {"name": token_data.get("name"), "symbol": token_data.get("symbol")})
                 ok, reason = passes_filters(token)
                 if not ok:
                     print(f"[SKIP] {token.get('name')} — {reason}")
@@ -378,7 +391,6 @@ def scan_loop():
 
                 print(f"[PASS] {token.get('name')} — ${mcap:,.0f} — IA en cours...")
 
-                # Analyse IA
                 twitter_data = get_twitter_data(token.get("twitter", ""))
                 analysis     = analyze_with_ai(token, twitter_data)
                 score        = analysis.get("score_confiance", {}).get("valeur", 0)
@@ -387,7 +399,6 @@ def scan_loop():
                     print(f"[SKIP AI] {token.get('name')} — Score {score}/10 trop bas")
                     continue
 
-                # Alerte !
                 with already_alerted_lock:
                     already_alerted.add(mint)
 
