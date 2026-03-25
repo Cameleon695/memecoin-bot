@@ -1,3 +1,4 @@
 requests
 groq
 beautifulsoup4
+websocket-client
